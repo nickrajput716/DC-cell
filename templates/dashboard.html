@@ -346,6 +346,7 @@ canvas#bg-canvas{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:va
     <button class="sb-link" data-section="analyze"><span class="sb-icon">🔬</span> Analyze Data<span class="sb-step">02</span></button>
     <button class="sb-link" data-section="report"><span class="sb-icon">📋</span> Generate Reports<span class="sb-step">03</span></button>
     <button class="sb-link" data-section="history"><span class="sb-icon">📁</span> Report History<span class="sb-step">04</span></button>
+    <button class="sb-link" data-section="dbhistory"><span class="sb-icon">🗄</span> DB Archives<span class="sb-step">05</span></button>
   </nav>
   <div class="sb-footer">
     <a href="/" class="btn-home"><span>🏠</span> Back to Home</a>
@@ -465,6 +466,54 @@ canvas#bg-canvas{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:va
       </div>
     </div>
   </section>
+  <!-- ══ STEP 5: DB ARCHIVES ══ -->
+<section class="db-section" id="dbhistory-section">
+  <div class="section-card">
+    <div class="sc-hdr">
+      <div class="sc-icon">🗄</div>
+      <div><div class="sc-title">DB Archives</div><div class="sc-sub">All reports & uploads persisted in MongoDB — available across sessions</div></div>
+      <div class="sc-step">05</div>
+    </div>
+
+    <!-- Filter bar -->
+    <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1.5rem;align-items:flex-end;">
+      <div class="rp-row">
+        <div class="rp-lbl">Year</div>
+        <select class="rp-sel" id="db-filter-year" style="min-width:110px;">
+          <option value="">All Years</option>
+          <option value="2026">2026</option>
+          <option value="2025">2025</option>
+          <option value="2024">2024</option>
+        </select>
+      </div>
+      <div class="rp-row">
+        <div class="rp-lbl">Month</div>
+        <select class="rp-sel" id="db-filter-month" style="min-width:130px;">
+          <option value="">All Months</option>
+          <option value="1">January</option><option value="2">February</option>
+          <option value="3">March</option><option value="4">April</option>
+          <option value="5">May</option><option value="6">June</option>
+          <option value="7">July</option><option value="8">August</option>
+          <option value="9">September</option><option value="10">October</option>
+          <option value="11">November</option><option value="12">December</option>
+        </select>
+      </div>
+      <button class="btn-next" style="margin:0;" onclick="loadDbReports()">🔍 Filter</button>
+      <button class="btn-next" style="margin:0;background:linear-gradient(135deg,var(--navy-mid),var(--navy-lt));" onclick="loadDbQuarterly()">📊 Quarterly</button>
+    </div>
+
+    <!-- Quarterly aggregation result -->
+    <div id="db-quarterly-result" style="display:none;margin-bottom:1.5rem;"></div>
+
+    <!-- Reports list -->
+    <div style="font-family:'Rajdhani',sans-serif;font-weight:700;color:var(--off-white);font-size:.95rem;margin-bottom:.8rem;">
+      Reports in Database <span id="db-report-count" style="font-family:'Orbitron',monospace;font-size:.6rem;color:var(--gold);background:rgba(255,215,0,.1);border:1px solid rgba(255,215,0,.2);border-radius:10px;padding:3px 10px;margin-left:8px;"></span>
+    </div>
+    <div class="history-list" id="dbReportsList">
+      <div class="history-empty">Click Filter or load all to see archived reports.</div>
+    </div>
+  </div>
+</section>
 </main>
 
 <script>
@@ -556,8 +605,8 @@ async function uploadFile(file) {
     const data = await res.json();
     if (data.error) { alert('Upload failed: ' + data.error); return; }
     if (!uploadedFiles.find(f => f.filename === data.filename)) {
-      uploadedFiles.push({filename:data.filename, rows:data.rows, displayName:file.name});
-    }
+        uploadedFiles.push({filename:data.filename, rows:data.rows, displayName:file.name, upload_id: data.upload_id || null});
+      }
     updateFilesUI();
   } catch(e) { alert('Upload failed: ' + e.message); }
 }
@@ -1000,6 +1049,7 @@ function getPerFileParams() {
     month:       document.getElementById(`pf-month-${idx}`)?.value || String(new Date().getMonth()+1),
     year:        document.getElementById(`pf-year-${idx}`)?.value  || String(CUR_YEAR),
     displayName: f.displayName,
+    upload_id:   f.upload_id || null,   // ← forward MongoDB upload _id
   }));
 }
 
@@ -1195,6 +1245,112 @@ updateClock(); setInterval(updateClock, 1000);
     requestAnimationFrame(draw);
   })();
 })();
+
+
+// ══ DB Archives Tab ═══════════════════════════════════════════════
+// Register section navigation for new tab
+document.querySelector('[data-section="dbhistory"]')
+  ?.addEventListener('click', () => {
+    showSection('dbhistory');
+    loadDbReports();
+  });
+
+async function loadDbReports() {
+  const year  = document.getElementById('db-filter-year')?.value  || '';
+  const month = document.getElementById('db-filter-month')?.value || '';
+  let url = '/api/reports?limit=100';
+  if (year)  url += `&year=${year}`;
+  if (month) url += `&month=${month}`;
+
+  const list  = document.getElementById('dbReportsList');
+  const count = document.getElementById('db-report-count');
+  list.innerHTML = '<div class="history-empty" style="color:var(--cyan)">Loading from MongoDB…</div>';
+
+  try {
+    const res   = await fetch(url);
+    const items = await res.json();
+    count.textContent = `${items.length} record${items.length !== 1 ? 's' : ''}`;
+
+    if (!items.length) {
+      list.innerHTML = '<div class="history-empty">No archived reports found for this filter.</div>';
+      return;
+    }
+
+    list.innerHTML = '';
+    items.forEach(item => {
+      const monthName = MONTHS[(item.period_month || 1) - 1] || '—';
+      const div = document.createElement('div');
+      div.className = 'history-item';
+      div.innerHTML = `
+        <div class="hi-left">
+          <div class="hi-name">${item.heading || 'Report'}<span class="hi-badge">DB</span></div>
+          <div class="hi-meta">
+            <span>📄 ${item.excel_filename || '—'}</span>
+            <span class="hi-meta-dot">·</span>
+            <span>📁 ${item.display_name || item.source_filename || '—'}</span>
+            <span class="hi-meta-dot">·</span>
+            <span>📅 ${monthName} ${item.period_year || ''}</span>
+            <span class="hi-meta-dot">·</span>
+            <span class="hi-meta-time">🕐 ${item.generated_at}</span>
+          </div>
+          <div style="display:flex;gap:1.2rem;margin-top:5px;font-size:.72rem;font-family:'Orbitron',monospace;">
+            <span style="color:var(--green-lt);">✅ NSN: ${item.totals?.nsn_allotted ?? '—'}</span>
+            <span style="color:var(--cyan);">➡ Fwd: ${item.totals?.fwd_dca ?? '—'}</span>
+            <span style="color:var(--gold);">📦 Total: ${item.totals?.total_codified ?? '—'}</span>
+            <span style="color:var(--red);">↩ Ret: ${item.totals?.returned ?? '—'}</span>
+          </div>
+        </div>
+        <div class="hi-dl">
+          ${item.excel_filename
+            ? `<a href="/download/${item.excel_filename}">⬇ Download</a>`
+            : '<span style="color:var(--gray)">No file</span>'}
+        </div>`;
+      list.appendChild(div);
+    });
+  } catch(e) {
+    list.innerHTML = `<div class="history-empty" style="color:var(--red);">Error: ${e.message}</div>`;
+  }
+}
+
+async function loadDbQuarterly() {
+  const year    = document.getElementById('db-filter-year')?.value;
+  const resultEl = document.getElementById('db-quarterly-result');
+  if (!year) {
+    resultEl.style.display = 'block';
+    resultEl.innerHTML = '<div style="color:var(--red);font-size:.85rem;">Please select a year first.</div>';
+    return;
+  }
+  resultEl.style.display = 'block';
+  resultEl.innerHTML = '<div style="color:var(--cyan);font-size:.8rem;font-family:\'Orbitron\',monospace;">Loading quarterly data…</div>';
+
+  try {
+    const quarters = await Promise.all([1,2,3,4].map(q =>
+      fetch(`/api/aggregate/quarterly?year=${year}&quarter=${q}`).then(r => r.json())
+    ));
+    const qNames = ['Q1 (Jan–Mar)', 'Q2 (Apr–Jun)', 'Q3 (Jul–Sep)', 'Q4 (Oct–Dec)'];
+    resultEl.innerHTML = `
+      <div style="background:var(--bg-card2);border:1px solid var(--section-card-border);border-radius:12px;padding:1.2rem;">
+        <div style="font-family:'Rajdhani',sans-serif;font-weight:700;color:var(--off-white);margin-bottom:1rem;">
+          📊 Quarterly Aggregation — ${year}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:.8rem;">
+          ${quarters.map((q, i) => `
+            <div style="background:var(--kpi-bg);border:1px solid var(--kpi-border);border-radius:9px;padding:.9rem;text-align:center;">
+              <div style="font-family:'Orbitron',monospace;font-size:.55rem;color:var(--cyan);margin-bottom:.5rem;letter-spacing:.1em;">${qNames[i]}</div>
+              <div style="font-family:'Orbitron',monospace;font-size:1.1rem;color:var(--gold);font-weight:700;">${q.total_codified}</div>
+              <div style="font-size:.58rem;color:var(--gray);margin-top:2px;">Total Codified</div>
+              <div style="margin-top:.5rem;display:flex;justify-content:center;gap:.6rem;font-size:.6rem;font-family:'Orbitron',monospace;">
+                <span style="color:var(--green-lt);">NSN:${q.nsn_allotted}</span>
+                <span style="color:var(--cyan);">Fwd:${q.fwd_dca}</span>
+              </div>
+              <div style="font-size:.58rem;color:var(--gray);margin-top:4px;">${q.report_count} report${q.report_count!==1?'s':''}</div>
+            </div>`).join('')}
+        </div>
+      </div>`;
+  } catch(e) {
+    resultEl.innerHTML = `<div style="color:var(--red);font-size:.85rem;">Error: ${e.message}</div>`;
+  }
+}
 </script>
 </body>
 </html>

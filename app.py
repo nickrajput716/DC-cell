@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 from flask import Flask, render_template, request, jsonify, send_file
 import pandas as pd
 import numpy as np
@@ -13,6 +15,10 @@ import calendar
 from report_generator import generate_report
 import warnings
 warnings.filterwarnings('ignore')
+# ── MongoDB integration ───────────────────────────────────────────
+from db import (save_upload, get_uploads, save_report,
+                get_reports, aggregate_quarterly, aggregate_yearly,
+                aggregate_dpsu)
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -747,11 +753,31 @@ def upload():
     path = os.path.join(app.config['UPLOAD_FOLDER'], f.filename)
     f.save(path)
     try:
-        df = pd.read_excel(path)
-        cols = list(df.columns)
+        df      = pd.read_excel(path)
+        cols    = list(df.columns)
         preview = df.head(5).fillna('').to_dict(orient='records')
-        return jsonify({'success': True, 'columns': cols, 'rows': len(df),
-                        'preview': preview, 'filename': f.filename})
+        row_count = len(df)
+
+        # ── Persist upload metadata to MongoDB ───────────────────
+        engine     = DataEngine(df)
+        stats      = engine.summary(df)
+        dpsu_list  = sorted(df['DPSU'].dropna().unique().tolist()) \
+                     if 'DPSU' in df.columns else []
+        upload_id  = None
+        try:
+            upload_id = save_upload(
+                filename     = f.filename,
+                display_name = f.filename,
+                rows         = row_count,
+                stats        = stats,
+                dpsu_list    = dpsu_list,
+            )
+        except Exception as db_err:
+            app.logger.warning(f"MongoDB upload save failed: {db_err}")
+
+        return jsonify({'success': True, 'columns': cols, 'rows': row_count,
+                        'preview': preview, 'filename': f.filename,
+                        'upload_id': upload_id})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -853,33 +879,46 @@ def generate_multi():
 
     results = []
     for entry in per_file:
-        filename = entry.get('filename')
-        year     = entry.get('year', '')
-        month    = entry.get('month', '')
+        filename   = entry.get('filename')
+        year       = entry.get('year', '')
+        month      = entry.get('month', '')
+        upload_id  = entry.get('upload_id')          # passed from frontend
+        display_name = entry.get('displayName', filename or 'Training Dataset')
 
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename) if filename else TRAINING_DATA_PATH
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename) \
+                   if filename else TRAINING_DATA_PATH
         if not os.path.exists(filepath):
             results.append({'filename': filename, 'error': 'File not found'})
             continue
 
         month_name = ''
+        period_month_int = 0
+        period_year_int  = 0
         if month and year:
             try:
-                month_name = datetime(1900, int(month), 1).strftime('%B').upper() + f' {year}'
+                period_month_int = int(month)
+                period_year_int  = int(year)
+                month_name = datetime(1900, period_month_int, 1).strftime('%B').upper() \
+                             + f' {year}'
             except Exception:
                 month_name = ''
-        heading = f'CODIFICATION SUMMARY FOR THE MONTH OF {month_name}' if month_name else f'CODIFICATION SUMMARY — {filename}'
+        heading = (f'CODIFICATION SUMMARY FOR THE MONTH OF {month_name}'
+                   if month_name else f'CODIFICATION SUMMARY — {filename}')
 
         try:
             report_data = generate_report(filepath)
-            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-            safe_name = (filename or 'training').replace('.xlsx','').replace('.xls','').replace(' ','_')
+            ts          = datetime.now().strftime('%Y%m%d_%H%M%S')
+            safe_name   = (filename or 'training') \
+                          .replace('.xlsx','').replace('.xls','').replace(' ','_')
             excel_filename_base = f'report_{safe_name}_{ts}'
-            excel_path = build_excel_from_report_data(report_data, heading, excel_filename_base)
+            excel_path          = build_excel_from_report_data(
+                                      report_data, heading, excel_filename_base)
             excel_filename = os.path.basename(excel_path)
 
+            # ── Build rows for HTML table AND MongoDB ─────────────
             rows_html = []
-            totals = {'codified':0,'fwd':0,'nsn':0,'returned':0}
+            mongo_rows = []
+            totals = {'codified': 0, 'fwd': 0, 'nsn': 0, 'returned': 0}
             serial = 1
             for dpsu, items in report_data.items():
                 for idx, item in enumerate(items):
@@ -888,26 +927,52 @@ def generate_multi():
                     totals['nsn']      += item['NSN']
                     totals['returned'] += item['Returned']
                     rows_html.append({
-                        'serial': serial,
-                        'dpsu': dpsu if idx == 0 else '',
-                        'dpsu_rowspan': len(items) if idx == 0 else 0,
-                        'equipment': item['Equipment'],
-                        'total_codified': item['Total_Codified'],
-                        'fwd_dca': item['Fwd_DCA'],
-                        'nsn': item['NSN'],
-                        'returned': item['Returned'],
+                        'serial':        serial,
+                        'dpsu':          dpsu if idx == 0 else '',
+                        'dpsu_rowspan':  len(items) if idx == 0 else 0,
+                        'equipment':     item['Equipment'],
+                        'total_codified':item['Total_Codified'],
+                        'fwd_dca':       item['Fwd_DCA'],
+                        'nsn':           item['NSN'],
+                        'returned':      item['Returned'],
+                    })
+                    mongo_rows.append({
+                        'dpsu':          dpsu,
+                        'equipment':     item['Equipment'],
+                        'total_codified':item['Total_Codified'],
+                        'fwd_dca':       item['Fwd_DCA'],
+                        'nsn_allotted':  item['NSN'],
+                        'returned':      item['Returned'],
                     })
                     serial += 1
 
+            # ── Persist report to MongoDB ─────────────────────────
+            report_doc_id = None
+            try:
+                report_doc_id = save_report(
+                    excel_filename   = excel_filename,
+                    heading          = heading,
+                    period_month     = period_month_int,
+                    period_year      = period_year_int,
+                    source_filename  = filename or 'training_dataset',
+                    display_name     = display_name,
+                    totals           = totals,
+                    rows             = mongo_rows,
+                    source_upload_id = upload_id,
+                )
+            except Exception as db_err:
+                app.logger.warning(f"MongoDB report save failed: {db_err}")
+
             results.append({
-                'filename': filename,
-                'heading': heading,
-                'period_month': month,
-                'period_year': year,
+                'filename':       filename,
+                'heading':        heading,
+                'period_month':   month,
+                'period_year':    year,
                 'excel_filename': excel_filename,
-                'rows': rows_html,
-                'totals': totals,
-                'serial_end': serial,
+                'report_id':      report_doc_id,
+                'rows':           rows_html,
+                'totals':         totals,
+                'serial_end':     serial,
             })
         except Exception as ex:
             results.append({'filename': filename, 'error': str(ex)})
@@ -938,6 +1003,81 @@ def training_stats():
     stats['dpsu_list'] = dpsu_list
     stats['total_rows'] = len(df)
     return jsonify(stats)
+
+
+
+# ── MongoDB-backed API routes ─────────────────────────────────────────────────
+
+@app.route('/api/uploads')
+def api_uploads():
+    """Return recent uploads stored in MongoDB."""
+    limit = int(request.args.get('limit', 50))
+    try:
+        return jsonify(get_uploads(limit))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/reports')
+def api_reports():
+    """
+    Return reports from MongoDB.
+    Optional query params: year, month, dpsu, limit
+    """
+    year  = request.args.get('year',  type=int)
+    month = request.args.get('month', type=int)
+    dpsu  = request.args.get('dpsu')
+    limit = int(request.args.get('limit', 100))
+    try:
+        return jsonify(get_reports(limit=limit, year=year, month=month, dpsu=dpsu))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/aggregate/quarterly')
+def api_quarterly():
+    """
+    Return aggregated totals for a quarter.
+    Params: year (int), quarter (1-4)
+    Example: /api/aggregate/quarterly?year=2026&quarter=1
+    """
+    year    = request.args.get('year',    type=int)
+    quarter = request.args.get('quarter', type=int)
+    if not year or not quarter:
+        return jsonify({'error': 'year and quarter are required'}), 400
+    try:
+        return jsonify(aggregate_quarterly(year, quarter))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/aggregate/yearly')
+def api_yearly():
+    """
+    Return aggregated totals for a full year.
+    Params: year (int)
+    Example: /api/aggregate/yearly?year=2026
+    """
+    year = request.args.get('year', type=int)
+    if not year:
+        return jsonify({'error': 'year is required'}), 400
+    try:
+        return jsonify(aggregate_yearly(year))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/aggregate/dpsu')
+def api_dpsu():
+    """
+    Return DPSU-wise aggregated totals (optionally filtered by year).
+    Example: /api/aggregate/dpsu?year=2026
+    """
+    year = request.args.get('year', type=int)
+    try:
+        return jsonify(aggregate_dpsu(year))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
